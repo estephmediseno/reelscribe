@@ -18,25 +18,37 @@ DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-v2-G
 
 
 def _setup_nvidia_cuda_env() -> None:
-    """Preload NVIDIA runtime libraries (cuBLAS, cuDNN) if installed in the active virtualenv."""
+    """Preload NVIDIA runtime libraries (cuBLASLt, cuBLAS, cuDNN) in global symbol space if installed."""
     try:
         import ctypes
         import site
-        search_dirs = site.getsitepackages()
+        search_dirs = list(site.getsitepackages())
         venv_sp = Path(sys.executable).parent.parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
         if venv_sp.exists():
             search_dirs.append(str(venv_sp))
 
+        lib_patterns = [
+            "**/libcublasLt.so*",
+            "**/libcublas.so*",
+            "**/libcudnn*.so*",
+        ]
+
+        found_dirs = set()
         for base in search_dirs:
             nvidia_dir = Path(base) / "nvidia"
             if not nvidia_dir.is_dir():
                 continue
-            for pattern in ["libcublas.so*", "libcudnn.so*"]:
-                for found in nvidia_dir.glob(f"**/{pattern}"):
+            for pattern in lib_patterns:
+                for found in sorted(nvidia_dir.glob(pattern)):
                     try:
-                        ctypes.CDLL(str(found))
+                        ctypes.CDLL(str(found), mode=ctypes.RTLD_GLOBAL)
+                        found_dirs.add(str(found.parent))
                     except Exception:
                         pass
+
+        if found_dirs:
+            cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = ":".join(list(found_dirs) + ([cur_ld] if cur_ld else []))
     except Exception:
         pass
 
@@ -212,8 +224,13 @@ def get_whisper_model(
         return _MODEL_CACHE[cache_key]
 
     try:
-        print(f"[Whisper] Loading model '{model_size}' on {resolved_device} ({resolved_compute})...", file=sys.stderr)
+        gpu_label = "NVIDIA CUDA (RTX)" if resolved_device == "cuda" else resolved_device.upper()
+        print(f"[Whisper] Loading model '{model_size}' on {gpu_label} ({resolved_compute})...", file=sys.stderr)
         model = WhisperModel(model_size, device=resolved_device, compute_type=resolved_compute)
+        if resolved_device == "cuda":
+            import numpy as np
+            # Immediate warm-up to ensure CUDA kernels and runtime libraries load properly
+            list(model.transcribe(np.zeros(16000, dtype=np.float32))[0])
         _MODEL_CACHE[cache_key] = model
         return model
     except Exception as exc:
