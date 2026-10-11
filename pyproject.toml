@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "reelscribe"
 version = "0.1.0"
-description = "Descarga y transcribe videos de TikTok e Instagram en archivos individuales (.md, .srt, .json)"
+description = "Batch TikTok and Instagram Reels transcription and local Ollama content analytics CLI"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

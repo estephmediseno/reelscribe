@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+SHORT_LINK_HOSTS = {"vm.tiktok.com", "vt.tiktok.com", "instagr.am"}
+DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-v2-GGUF:Q4_K_M"
+
 
 def slugify(text: str, max_len: int = 45) -> str:
     text = text.lower().strip()
@@ -41,11 +44,8 @@ def format_mmss(seconds: float) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
-SHORT_LINK_HOSTS = {"vm.tiktok.com", "vt.tiktok.com", "instagr.am"}
-
-
 def resolve_url(url: str) -> str:
-    """Resuelve short links (ej. vm.tiktok.com, vt.tiktok.com) y limpia parámetros de rastreo."""
+    """Resolve mobile short links (e.g. vm.tiktok.com, vt.tiktok.com) and strip tracking parameters."""
     url = url.strip()
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -77,7 +77,7 @@ def resolve_url(url: str) -> str:
 
 
 def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = None) -> tuple[Path, dict[str, Any]]:
-    """Descarga el audio y metadatos de una URL de TikTok/Instagram usando yt-dlp."""
+    """Download audio stream and metadata from a TikTok or Instagram URL using yt-dlp."""
     resolved_url = resolve_url(url)
     out_tmpl = str(dest_dir / "%(id)s.%(ext)s")
     cmd = [
@@ -98,11 +98,11 @@ def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = 
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"Error en yt-dlp para {url}:\n{proc.stderr.strip()}")
+        raise RuntimeError(f"yt-dlp failed for {url}:\n{proc.stderr.strip()}")
 
     info_files = sorted(dest_dir.glob("*.info.json"), key=os.path.getmtime, reverse=True)
     if not info_files:
-        raise FileNotFoundError(f"No se encontró archivo .info.json tras descargar {url}")
+        raise FileNotFoundError(f"No .info.json file found after downloading {url}")
 
     info_path = info_files[0]
     with open(info_path, "r", encoding="utf-8") as f:
@@ -115,7 +115,7 @@ def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = 
     if not audio_files:
         audio_files = [p for p in dest_dir.glob("*.mp3")]
     if not audio_files:
-        raise FileNotFoundError(f"No se encontró el archivo de audio para {url}")
+        raise FileNotFoundError(f"Audio file not found for {url}")
 
     return audio_files[0], info
 
@@ -127,7 +127,7 @@ def transcribe_audio(
     device: str = "cpu",
     compute_type: str = "int8",
 ) -> dict[str, Any]:
-    """Transcribe un archivo de audio con faster-whisper devolviendo segmentos y palabras."""
+    """Transcribe an audio file with faster-whisper, returning segments and word-level timestamps."""
     from faster_whisper import WhisperModel
 
     def _run(dev: str, ctype: str):
@@ -191,24 +191,24 @@ def write_outputs(
     transcript: dict[str, Any],
     out_dir: Path,
 ) -> dict[str, Path]:
-    """Escribe los archivos .md, .srt y .json para un video."""
+    """Write per-video .md, .srt, and .json output files."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     platform = (info.get("extractor_key") or info.get("extractor") or "video").lower()
     vid_id = str(info.get("id") or f"v{index}")
     title = info.get("title") or info.get("description") or vid_id
     title_first_line = title.splitlines()[0].strip() if title else vid_id
-    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Desconocido"
+    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Unknown"
     duration = info.get("duration") or transcript.get("duration") or 0
 
-    slug = slugify(f"{platform}_{uploader}_{ vid_id }")
+    slug = slugify(f"{platform}_{uploader}_{vid_id}")
     base_name = f"{index:02d}_{slug}"
 
     md_path = out_dir / f"{base_name}.md"
     srt_path = out_dir / f"{base_name}.srt"
     json_path = out_dir / f"{base_name}.json"
 
-    # 1. Archivo SRT
+    # 1. SubRip (.srt) file
     srt_lines = []
     for i, seg in enumerate(transcript["segments"], start=1):
         start_ts = format_srt_timestamp(seg["start"])
@@ -216,7 +216,7 @@ def write_outputs(
         srt_lines.append(f"{i}\n{start_ts} --> {end_ts}\n{seg['text']}\n")
     srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
 
-    # 2. Archivo JSON
+    # 2. Structured JSON (.json) file
     payload = {
         "index": index,
         "url": url,
@@ -237,12 +237,12 @@ def write_outputs(
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 3. Archivo Markdown (.md)
+    # 3. Clean Markdown (.md) file
     timestamped_lines = [
         f"- `[{format_mmss(seg['start'])} - {format_mmss(seg['end'])}]` {seg['text']}"
         for seg in transcript["segments"]
     ]
-    timestamped_block = "\n".join(timestamped_lines) if timestamped_lines else "_Sin voz detectada_"
+    timestamped_block = "\n".join(timestamped_lines) if timestamped_lines else "_No speech detected_"
 
     md_content = f"""# {index:02d}. {title_first_line}
 
@@ -266,16 +266,13 @@ def write_outputs(
     return {"md": md_path, "srt": srt_path, "json": json_path}
 
 
-DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-v2-GGUF:Q4_K_M"
-
-
 def summarize_with_ollama(
     items: list[dict[str, Any]],
     out_dir: Path,
     ollama_model: str = DEFAULT_OLLAMA_MODEL,
     ollama_url: str = "http://localhost:11434/api/chat",
 ) -> Path | None:
-    """Genera un resumen global de todas las transcripciones usando Ollama local y guarda resumen.md."""
+    """Generate a batch summary across all transcripts using local Ollama and write resumen.md."""
     if not items:
         return None
 
@@ -332,32 +329,32 @@ def summarize_with_ollama(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Descarga, transcribe videos de TikTok/Instagram (.md, .srt, .json) y resume todo con Ollama local."
+        description="Download and transcribe TikTok/Instagram videos (.md, .srt, .json) and summarize with local Ollama."
     )
-    parser.add_argument("urls", nargs="*", help="URLs de videos de TikTok, Instagram, etc. (incluyendo short links).")
-    parser.add_argument("-f", "--file", type=Path, help="Archivo de texto con una URL por línea.")
+    parser.add_argument("urls", nargs="*", help="TikTok, Instagram, or video URLs (including short links).")
+    parser.add_argument("-f", "--file", type=Path, help="Text file containing one URL per line.")
     parser.add_argument(
         "-o",
         "--output-dir",
         type=Path,
         default=Path("transcriptions"),
-        help="Directorio de salida (por defecto: transcriptions/).",
+        help="Output directory (default: transcriptions/).",
     )
     parser.add_argument(
         "-m",
         "--model",
         default="small",
-        help="Modelo de faster-whisper (tiny, base, small, medium, large-v3, large-v3-turbo). Por defecto: small.",
+        help="faster-whisper model size (tiny, base, small, medium, large-v3, large-v3-turbo). Default: small.",
     )
-    parser.add_argument("-l", "--language", default=None, help="Código de idioma forzado (ej. es, en). Auto por defecto.")
+    parser.add_argument("-l", "--language", default=None, help="Force language code (e.g. es, en). Auto by default.")
     parser.add_argument(
         "--ollama-model",
         default=DEFAULT_OLLAMA_MODEL,
-        help=f"Modelo de Ollama para el resumen final (por defecto: {DEFAULT_OLLAMA_MODEL}).",
+        help=f"Local Ollama model for batch summary (default: {DEFAULT_OLLAMA_MODEL}).",
     )
-    parser.add_argument("--no-summary", action="store_true", help="Omitir el resumen final con Ollama.")
-    parser.add_argument("--cookies-from-browser", default=None, help="Navegador para extraer cookies si es necesario.")
-    parser.add_argument("--keep-audio", action="store_true", help="Guardar también el archivo .mp3 en el directorio de salida.")
+    parser.add_argument("--no-summary", action="store_true", help="Skip the final Ollama summary step.")
+    parser.add_argument("--cookies-from-browser", default=None, help="Browser name to extract cookies from if needed.")
+    parser.add_argument("--keep-audio", action="store_true", help="Keep the extracted .mp3 file in the output directory.")
 
     args = parser.parse_args()
 
@@ -377,7 +374,7 @@ def main() -> int:
     for raw_url in raw_urls:
         canonical = resolve_url(raw_url)
         if canonical in seen_canonical:
-            print(f"[Omitido duplicado] {raw_url} -> {canonical}", file=sys.stderr)
+            print(f"[Skipped duplicate] {raw_url} -> {canonical}", file=sys.stderr)
             continue
         seen_canonical.add(canonical)
         urls.append(canonical)
@@ -387,7 +384,7 @@ def main() -> int:
     errors = []
 
     for idx, url in enumerate(urls, start=1):
-        print(f"[{idx}/{len(urls)}] Procesando: {url}", file=sys.stderr)
+        print(f"[{idx}/{len(urls)}] Processing: {url}", file=sys.stderr)
         try:
             with tempfile.TemporaryDirectory(prefix="reelscribe_") as tmp_str:
                 tmp_dir = Path(tmp_str)
@@ -404,7 +401,7 @@ def main() -> int:
 
                 platform = (info.get("extractor_key") or info.get("extractor") or "video").lower()
                 title = (info.get("title") or info.get("description") or str(info.get("id") or f"v{idx}")).splitlines()[0].strip()
-                uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Desconocido"
+                uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Unknown"
 
                 summary_inputs.append(
                     {
@@ -425,21 +422,21 @@ def main() -> int:
                         "json": str(paths["json"]),
                     }
                 )
-                print(f"  -> Guardado: {paths['md'].name} (.md, .srt, .json)", file=sys.stderr)
+                print(f"  -> Saved: {paths['md'].name} (.md, .srt, .json)", file=sys.stderr)
         except Exception as exc:
             print(f"  [ERROR] {url}: {exc}", file=sys.stderr)
             errors.append({"index": idx, "url": url, "error": str(exc)})
 
     resumen_file = None
     if summary_inputs and not args.no_summary:
-        print(f"Generando resumen global con Ollama ({args.ollama_model})...", file=sys.stderr)
+        print(f"Generating batch summary with Ollama ({args.ollama_model})...", file=sys.stderr)
         try:
             resumen_path = summarize_with_ollama(summary_inputs, args.output_dir, ollama_model=args.ollama_model)
             if resumen_path:
                 resumen_file = str(resumen_path)
-                print(f"  -> Resumen guardado en: {resumen_path}", file=sys.stderr)
+                print(f"  -> Summary saved to: {resumen_path}", file=sys.stderr)
         except Exception as exc:
-            print(f"  [ERROR Resumen Ollama]: {exc}", file=sys.stderr)
+            print(f"  [ERROR Ollama Summary]: {exc}", file=sys.stderr)
             errors.append({"stage": "ollama_summary", "error": str(exc)})
 
     summary_manifest = {

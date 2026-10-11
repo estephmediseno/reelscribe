@@ -1,3 +1,3 @@
-"""Reelscribe: Descarga y transcripción de videos de TikTok e Instagram."""
+"""Reelscribe: Batch TikTok and Instagram Reels transcription and content analytics CLI."""
 
 __version__ = "0.1.0"
