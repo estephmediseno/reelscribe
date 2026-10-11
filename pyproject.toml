@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reelscribe"
+version = "0.1.0"
+description = "Descarga y transcribe videos de TikTok e Instagram en archivos individuales (.md, .srt, .json)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "yt-dlp>=2024.1.0",
+]
+
+[project.scripts]
+reelscribe = "reelscribe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["reelscribe*"]
