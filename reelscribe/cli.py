@@ -17,6 +17,50 @@ SHORT_LINK_HOSTS = {"vm.tiktok.com", "vt.tiktok.com", "instagr.am"}
 DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-v2-GGUF:Q4_K_M"
 
 
+def _setup_nvidia_cuda_env() -> None:
+    """Carga bibliotecas de runtime NVIDIA (cuBLAS, cuDNN) si están en el virtualenv."""
+    try:
+        import ctypes
+        import site
+        search_dirs = site.getsitepackages()
+        venv_sp = Path(sys.executable).parent.parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+        if venv_sp.exists():
+            search_dirs.append(str(venv_sp))
+
+        for base in search_dirs:
+            nvidia_dir = Path(base) / "nvidia"
+            if not nvidia_dir.is_dir():
+                continue
+            for pattern in ["libcublas.so*", "libcudnn.so*"]:
+                for found in nvidia_dir.glob(f"**/{pattern}"):
+                    try:
+                        ctypes.CDLL(str(found))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _patch_pyav_compatibility() -> None:
+    """Garantiza compatibilidad de faster-whisper con versiones recientes de PyAV."""
+    try:
+        import av
+        orig_open = av.open
+
+        def _safe_av_open(*args: Any, **kwargs: Any) -> Any:
+            kwargs.pop("metadata_errors", None)
+            return orig_open(*args, **kwargs)
+
+        av.open = _safe_av_open
+    except Exception:
+        pass
+
+
+_setup_nvidia_cuda_env()
+_patch_pyav_compatibility()
+
+
+
 def slugify(text: str, max_len: int = 45) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -76,8 +120,14 @@ def resolve_url(url: str) -> str:
     return url
 
 
-def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = None) -> tuple[Path, dict[str, Any]]:
+def download_audio(
+    url: str,
+    dest_dir: Path,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
     """Download audio stream and metadata from a TikTok or Instagram URL using yt-dlp."""
+
     resolved_url = resolve_url(url)
     out_tmpl = str(dest_dir / "%(id)s.%(ext)s")
     cmd = [
@@ -94,6 +144,8 @@ def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = 
     ]
     if cookies_from_browser:
         cmd.extend(["--cookies-from-browser", cookies_from_browser])
+    if cookies_file:
+        cmd.extend(["--cookies", str(cookies_file)])
     cmd.append(resolved_url)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -115,37 +167,87 @@ def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = 
     if not audio_files:
         audio_files = [p for p in dest_dir.glob("*.mp3")]
     if not audio_files:
+        audio_files = [
+            p for p in dest_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".mp3", ".m4a", ".webm", ".wav", ".aac", ".opus", ".ogg"}
+        ]
+    if not audio_files:
         raise FileNotFoundError(f"Audio file not found for {url}")
 
     return audio_files[0], info
+
+
+_MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
+
+
+def get_whisper_model(
+    model_size: str = "small",
+    device: str = "auto",
+    compute_type: str | None = None,
+) -> Any:
+    """Load and cache the faster-whisper model in memory, prioritizing NVIDIA GPU."""
+    from faster_whisper import WhisperModel
+
+    resolved_device = device.lower()
+    if resolved_device == "auto":
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                resolved_device = "cuda"
+            else:
+                resolved_device = "cpu"
+        except Exception:
+            resolved_device = "cpu"
+
+    if compute_type is None or compute_type.lower() == "auto":
+        resolved_compute = "float16" if resolved_device == "cuda" else "int8"
+    else:
+        resolved_compute = compute_type
+
+    cache_key = (model_size, resolved_device, resolved_compute)
+    if cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]
+
+    try:
+        print(f"[Whisper] Loading model '{model_size}' on {resolved_device} ({resolved_compute})...", file=sys.stderr)
+        model = WhisperModel(model_size, device=resolved_device, compute_type=resolved_compute)
+        _MODEL_CACHE[cache_key] = model
+        return model
+    except Exception as exc:
+        if resolved_device != "cpu":
+            print(f"[Whisper] Failed on {resolved_device} ({exc}). Falling back to CPU...", file=sys.stderr)
+            fallback_key = (model_size, "cpu", "int8")
+            if fallback_key in _MODEL_CACHE:
+                return _MODEL_CACHE[fallback_key]
+            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            _MODEL_CACHE[fallback_key] = model
+            return model
+        raise exc
 
 
 def transcribe_audio(
     audio_path: Path,
     model_size: str = "small",
     language: str | None = None,
-    device: str = "cpu",
-    compute_type: str = "int8",
+    device: str = "auto",
+    compute_type: str | None = None,
+    model_instance: Any = None,
 ) -> dict[str, Any]:
     """Transcribe an audio file with faster-whisper, returning segments and word-level timestamps."""
-    from faster_whisper import WhisperModel
+    if model_instance is not None:
+        model = model_instance
+    else:
+        model = get_whisper_model(model_size=model_size, device=device, compute_type=compute_type)
 
-    def _run(dev: str, ctype: str):
-        model = WhisperModel(model_size, device=dev, compute_type=ctype)
-        segments_gen, info = model.transcribe(
-            str(audio_path),
-            language=language,
-            beam_size=5,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=400),
-        )
-        return list(segments_gen), info
-
-    try:
-        segments_list, info = _run(device, compute_type)
-    except Exception:
-        segments_list, info = _run("cpu", "int8")
+    segments_gen, info = model.transcribe(
+        str(audio_path),
+        language=language,
+        beam_size=5,
+        word_timestamps=True,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=400),
+    )
+    segments_list = list(segments_gen)
 
     segments = []
     full_text_parts = []
@@ -266,6 +368,17 @@ def write_outputs(
     return {"md": md_path, "srt": srt_path, "json": json_path}
 
 
+def is_ollama_available(ollama_url: str = "http://localhost:11434/api/chat") -> bool:
+    """Quickly check whether local Ollama is running and responding."""
+    try:
+        parsed = urlparse(ollama_url)
+        base = f"{parsed.scheme}://{parsed.netloc}/api/tags"
+        req = urllib.request.Request(base, headers={"User-Agent": "reelscribe"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
 def summarize_with_ollama(
     items: list[dict[str, Any]],
     out_dir: Path,
@@ -329,7 +442,7 @@ def summarize_with_ollama(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download and transcribe TikTok/Instagram videos (.md, .srt, .json) and summarize with local Ollama."
+        description="Download and transcribe TikTok/Instagram videos (.md, .srt, .json) and summarize with local AI."
     )
     parser.add_argument("urls", nargs="*", help="TikTok, Instagram, or video URLs (including short links).")
     parser.add_argument("-f", "--file", type=Path, help="Text file containing one URL per line.")
@@ -348,13 +461,33 @@ def main() -> int:
     )
     parser.add_argument("-l", "--language", default=None, help="Force language code (e.g. es, en). Auto by default.")
     parser.add_argument(
+        "-d",
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Device for faster-whisper (auto, cuda, cpu). Default: auto (uses NVIDIA GPU if available).",
+    )
+    parser.add_argument(
+        "--compute-type",
+        default=None,
+        help="Compute type for faster-whisper (e.g. float16, int8_float16, int8). Default: auto depending on device.",
+    )
+    parser.add_argument(
         "--ollama-model",
         default=DEFAULT_OLLAMA_MODEL,
         help=f"Local Ollama model for batch summary (default: {DEFAULT_OLLAMA_MODEL}).",
     )
+    parser.add_argument(
+        "--ollama-url",
+        default="http://localhost:11434/api/chat",
+        help="Ollama chat API URL (default: http://localhost:11434/api/chat).",
+    )
     parser.add_argument("--no-summary", action="store_true", help="Skip the final Ollama summary step.")
+    parser.add_argument("-c", "--cookies", type=Path, default=None, help="Path to cookies.txt file for authentication if needed.")
     parser.add_argument("--cookies-from-browser", default=None, help="Browser name to extract cookies from if needed.")
     parser.add_argument("--keep-audio", action="store_true", help="Keep the extracted .mp3 file in the output directory.")
+    parser.add_argument("--open-dir", action="store_true", help="Open the output directory in file explorer upon completion.")
+
 
     args = parser.parse_args()
 
@@ -364,6 +497,15 @@ def main() -> int:
             line = line.strip()
             if line and not line.startswith("#"):
                 raw_urls.append(line)
+
+    if not raw_urls and not sys.stdin.isatty():
+        try:
+            for line in sys.stdin.read().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    raw_urls.append(line)
+        except Exception:
+            pass
 
     if not raw_urls:
         parser.print_help()
@@ -379,6 +521,13 @@ def main() -> int:
         seen_canonical.add(canonical)
         urls.append(canonical)
 
+    # Inicializar modelo Whisper una sola vez para todo el lote
+    whisper_model = get_whisper_model(
+        model_size=args.model,
+        device=args.device,
+        compute_type=args.compute_type,
+    )
+
     results = []
     summary_inputs = []
     errors = []
@@ -388,10 +537,15 @@ def main() -> int:
         try:
             with tempfile.TemporaryDirectory(prefix="reelscribe_") as tmp_str:
                 tmp_dir = Path(tmp_str)
-                audio_path, info = download_audio(url, tmp_dir, args.cookies_from_browser)
+                audio_path, info = download_audio(
+                    url,
+                    tmp_dir,
+                    cookies_from_browser=args.cookies_from_browser,
+                    cookies_file=args.cookies,
+                )
                 transcript = transcribe_audio(
                     audio_path,
-                    model_size=args.model,
+                    model_instance=whisper_model,
                     language=args.language,
                 )
                 paths = write_outputs(idx, url, info, transcript, args.output_dir)
@@ -429,15 +583,33 @@ def main() -> int:
 
     resumen_file = None
     if summary_inputs and not args.no_summary:
-        print(f"Generating batch summary with Ollama ({args.ollama_model})...", file=sys.stderr)
+        if not is_ollama_available(args.ollama_url):
+            print(
+                "\n[Notice] Local Ollama is not active on localhost:11434. Skipping batch summary.",
+                file=sys.stderr,
+            )
+            print("         (Individual transcripts, subtitles, and JSON files were saved successfully)", file=sys.stderr)
+        else:
+            print(f"Generating batch summary with Ollama ({args.ollama_model})...", file=sys.stderr)
+            try:
+                resumen_path = summarize_with_ollama(
+                    summary_inputs,
+                    args.output_dir,
+                    ollama_model=args.ollama_model,
+                    ollama_url=args.ollama_url,
+                )
+                if resumen_path:
+                    resumen_file = str(resumen_path)
+                    print(f"  -> Summary saved to: {resumen_path}", file=sys.stderr)
+            except Exception as exc:
+                print(f"  [ERROR Ollama Summary]: {exc}", file=sys.stderr)
+
+    if args.open_dir and args.output_dir.exists():
         try:
-            resumen_path = summarize_with_ollama(summary_inputs, args.output_dir, ollama_model=args.ollama_model)
-            if resumen_path:
-                resumen_file = str(resumen_path)
-                print(f"  -> Summary saved to: {resumen_path}", file=sys.stderr)
-        except Exception as exc:
-            print(f"  [ERROR Ollama Summary]: {exc}", file=sys.stderr)
-            errors.append({"stage": "ollama_summary", "error": str(exc)})
+            subprocess.run(["explorer.exe", str(args.output_dir)], check=False)
+        except Exception:
+            pass
+
 
     summary_manifest = {
         "processed": len(results),
