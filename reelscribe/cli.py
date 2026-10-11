@@ -18,7 +18,7 @@ DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-v2-G
 
 
 def _setup_nvidia_cuda_env() -> None:
-    """Carga bibliotecas de runtime NVIDIA (cuBLAS, cuDNN) si están en el virtualenv."""
+    """Preload NVIDIA runtime libraries (cuBLAS, cuDNN) if installed in the active virtualenv."""
     try:
         import ctypes
         import site
@@ -42,7 +42,7 @@ def _setup_nvidia_cuda_env() -> None:
 
 
 def _patch_pyav_compatibility() -> None:
-    """Garantiza compatibilidad de faster-whisper con versiones recientes de PyAV."""
+    """Ensure faster-whisper compatibility with recent PyAV versions."""
     try:
         import av
         orig_open = av.open
@@ -524,7 +524,7 @@ def main() -> int:
         seen_canonical.add(canonical)
         urls.append(canonical)
 
-    # Inicializar modelo Whisper una sola vez para todo el lote
+    # Initialize the Whisper model once for the entire batch
     whisper_model = get_whisper_model(
         model_size=args.model,
         device=args.device,
