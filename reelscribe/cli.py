@@ -128,10 +128,13 @@ def download_audio(
 ) -> tuple[Path, dict[str, Any]]:
     """Download audio stream and metadata from a TikTok or Instagram URL using yt-dlp."""
 
+    import shutil
+
+    yt_dlp_bin = shutil.which("yt-dlp") or str(Path(sys.executable).parent / "yt-dlp")
     resolved_url = resolve_url(url)
     out_tmpl = str(dest_dir / "%(id)s.%(ext)s")
     cmd = [
-        "yt-dlp",
+        yt_dlp_bin,
         "--no-playlist",
         "--write-info-json",
         "-x",
