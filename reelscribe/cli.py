@@ -6,9 +6,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 
 def slugify(text: str, max_len: int = 45) -> str:
@@ -38,8 +41,44 @@ def format_mmss(seconds: float) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+SHORT_LINK_HOSTS = {"vm.tiktok.com", "vt.tiktok.com", "instagr.am"}
+
+
+def resolve_url(url: str) -> str:
+    """Resuelve short links (ej. vm.tiktok.com, vt.tiktok.com) y limpia parámetros de rastreo."""
+    url = url.strip()
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+
+    if host in SHORT_LINK_HOSTS or "/t/" in parsed.path:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                url = resp.geturl()
+                parsed = urlparse(url)
+                host = parsed.netloc.lower()
+        except Exception:
+            pass
+
+    if "tiktok.com" in host or "instagram.com" in host:
+        parsed = parsed._replace(query="", fragment="")
+        url = urlunparse(parsed)
+
+    return url
+
+
 def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = None) -> tuple[Path, dict[str, Any]]:
     """Descarga el audio y metadatos de una URL de TikTok/Instagram usando yt-dlp."""
+    resolved_url = resolve_url(url)
     out_tmpl = str(dest_dir / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
@@ -55,7 +94,7 @@ def download_audio(url: str, dest_dir: Path, cookies_from_browser: str | None = 
     ]
     if cookies_from_browser:
         cmd.extend(["--cookies-from-browser", cookies_from_browser])
-    cmd.append(url)
+    cmd.append(resolved_url)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -85,25 +124,32 @@ def transcribe_audio(
     audio_path: Path,
     model_size: str = "small",
     language: str | None = None,
-    device: str = "auto",
-    compute_type: str = "default",
+    device: str = "cpu",
+    compute_type: str = "int8",
 ) -> dict[str, Any]:
     """Transcribe un archivo de audio con faster-whisper devolviendo segmentos y palabras."""
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    segments_gen, info = model.transcribe(
-        str(audio_path),
-        language=language,
-        beam_size=5,
-        word_timestamps=True,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
-    )
+    def _run(dev: str, ctype: str):
+        model = WhisperModel(model_size, device=dev, compute_type=ctype)
+        segments_gen, info = model.transcribe(
+            str(audio_path),
+            language=language,
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400),
+        )
+        return list(segments_gen), info
+
+    try:
+        segments_list, info = _run(device, compute_type)
+    except Exception:
+        segments_list, info = _run("cpu", "int8")
 
     segments = []
     full_text_parts = []
-    for idx, seg in enumerate(segments_gen, start=1):
+    for idx, seg in enumerate(segments_list, start=1):
         text = seg.text.strip()
         if not text:
             continue
@@ -220,9 +266,6 @@ def write_outputs(
     return {"md": md_path, "srt": srt_path, "json": json_path}
 
 
-import urllib.error
-import urllib.request
-
 DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-v2-GGUF:Q4_K_M"
 
 
@@ -291,7 +334,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Descarga, transcribe videos de TikTok/Instagram (.md, .srt, .json) y resume todo con Ollama local."
     )
-    parser.add_argument("urls", nargs="*", help="URLs de videos de TikTok, Instagram, etc.")
+    parser.add_argument("urls", nargs="*", help="URLs de videos de TikTok, Instagram, etc. (incluyendo short links).")
     parser.add_argument("-f", "--file", type=Path, help="Archivo de texto con una URL por línea.")
     parser.add_argument(
         "-o",
@@ -318,16 +361,26 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    urls: list[str] = list(args.urls)
+    raw_urls: list[str] = list(args.urls)
     if args.file and args.file.exists():
         for line in args.file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
-                urls.append(line)
+                raw_urls.append(line)
 
-    if not urls:
+    if not raw_urls:
         parser.print_help()
         return 1
+
+    urls: list[str] = []
+    seen_canonical: set[str] = set()
+    for raw_url in raw_urls:
+        canonical = resolve_url(raw_url)
+        if canonical in seen_canonical:
+            print(f"[Omitido duplicado] {raw_url} -> {canonical}", file=sys.stderr)
+            continue
+        seen_canonical.add(canonical)
+        urls.append(canonical)
 
     results = []
     summary_inputs = []
